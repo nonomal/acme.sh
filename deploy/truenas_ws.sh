@@ -16,7 +16,12 @@
 #
 # # API KEY
 # # Use the folowing URL to create a new API token: <TRUENAS_HOSTNAME OR IP>/ui/apikeys
-# export DEPLOY_TRUENAS_APIKEY="<API_KEY_GENERATED_IN_THE_WEB_UI"
+# export DEPLOY_TRUENAS_APIKEY="<API_KEY_GENERATED_IN_THE_WEB_UI>"
+# Optional:
+# export DEPLOY_TRUENAS_HOSTNAME="<TRUENAS_HOSTNAME_OR_IP>"
+# export DEPLOY_TRUENAS_PROTOCOL="wss"   # ws or wss
+# export DEPLOY_TRUENAS_PORT="443"       # optional, e.g. 80, 443, 8443
+
 #
 
 ### Private functions
@@ -39,17 +44,48 @@ _ws_call() {
   _debug "_ws_call arg2" "$2"
   _debug "_ws_call arg3" "$3"
   if [ $# -eq 3 ]; then
-    _ws_response=$(midclt -K "$DEPLOY_TRUENAS_APIKEY" call "$1" "$2" "$3")
+    _ws_response=$(midclt --uri "$_ws_uri" -K "$DEPLOY_TRUENAS_APIKEY" call "$1" "$2" "$3")
   fi
   if [ $# -eq 2 ]; then
-    _ws_response=$(midclt -K "$DEPLOY_TRUENAS_APIKEY" call "$1" "$2")
+    _ws_response=$(midclt --uri "$_ws_uri" -K "$DEPLOY_TRUENAS_APIKEY" call "$1" "$2")
   fi
   if [ $# -eq 1 ]; then
-    _ws_response=$(midclt -K "$DEPLOY_TRUENAS_APIKEY" call "$1")
+    _ws_response=$(midclt --uri "$_ws_uri" -K "$DEPLOY_TRUENAS_APIKEY" call "$1")
   fi
   _debug "_ws_response" "$_ws_response"
   printf "%s" "$_ws_response"
   return 0
+}
+
+# Upload certificate with webclient api
+_ws_upload_cert() {
+
+  /usr/bin/env python - <<EOF
+import sys
+
+from truenas_api_client import Client
+with Client(uri="$_ws_uri") as c:
+
+  ### Login with API key
+  print("I:Trying to upload new certificate...")
+  ret = c.call("auth.login_with_api_key", "${DEPLOY_TRUENAS_APIKEY}")
+  if ret:
+    ### upload certificate
+    with open('$1', 'r') as file:
+      fullchain = file.read()
+    with open('$2', 'r') as file:
+      privatekey = file.read()
+    ret = c.call("certificate.create", {"name": "$3", "create_type": "CERTIFICATE_CREATE_IMPORTED", "certificate": fullchain, "privatekey": privatekey}, job=True)
+    print("R:" + str(ret["id"]))
+    sys.exit(0)
+  else:
+    print("R:0")
+    print("E:_ws_upload_cert error!")
+    sys.exit(7)
+EOF
+
+  return $?
+
 }
 
 # Check argument is a number
@@ -88,7 +124,7 @@ _ws_check_jobid() {
 #   n/a
 _ws_get_job_result() {
   while true; do
-    sleep 2
+    _sleep 2
     _ws_response=$(_ws_call "core.get_jobs" "[[\"id\", \"=\", $1]]")
     if [ "$(printf "%s" "$_ws_response" | jq -r '.[]."state"')" != "RUNNING" ]; then
       _ws_result="$(printf "%s" "$_ws_response" | jq '.[]."result"')"
@@ -129,7 +165,6 @@ _ws_get_job_result() {
 #  5: WebUI cert error
 #  6: Job error
 #  7: WS call error
-# 10: No CORE or SCALE detected
 #
 truenas_ws_deploy() {
   _domain="$1"
@@ -147,11 +182,43 @@ truenas_ws_deploy() {
 
   _info "Checking environment variables..."
   _getdeployconf DEPLOY_TRUENAS_APIKEY
+  _getdeployconf DEPLOY_TRUENAS_HOSTNAME
+  _getdeployconf DEPLOY_TRUENAS_PROTOCOL
+  _getdeployconf DEPLOY_TRUENAS_PORT
+
   # Check API Key
   if [ -z "$DEPLOY_TRUENAS_APIKEY" ]; then
     _err "TrueNAS API key not found, please set the DEPLOY_TRUENAS_APIKEY environment variable."
     return 1
   fi
+  # Check Hostname, default to localhost if not set
+  if [ -z "$DEPLOY_TRUENAS_HOSTNAME" ]; then
+    _info "TrueNAS hostname not set. Using 'localhost'."
+    DEPLOY_TRUENAS_HOSTNAME="localhost"
+  fi
+  # Check protocol, default to ws if not set
+  if [ -z "$DEPLOY_TRUENAS_PROTOCOL" ]; then
+    _info "TrueNAS protocol not set. Using 'ws'."
+    DEPLOY_TRUENAS_PROTOCOL="ws"
+  fi
+
+  # Check port, optional
+  if [ -n "$DEPLOY_TRUENAS_PORT" ]; then
+    case "$DEPLOY_TRUENAS_PORT" in
+    '' | *[!0-9]*)
+      _err "Invalid TrueNAS port '$DEPLOY_TRUENAS_PORT'. DEPLOY_TRUENAS_PORT must be numeric."
+      return 8
+      ;;
+    esac
+
+    _ws_uri="$DEPLOY_TRUENAS_PROTOCOL://$DEPLOY_TRUENAS_HOSTNAME:$DEPLOY_TRUENAS_PORT/websocket"
+  else
+    _ws_uri="$DEPLOY_TRUENAS_PROTOCOL://$DEPLOY_TRUENAS_HOSTNAME/websocket"
+  fi
+
+  _debug2 DEPLOY_TRUENAS_HOSTNAME "$DEPLOY_TRUENAS_HOSTNAME"
+  _debug2 DEPLOY_TRUENAS_PROTOCOL "$DEPLOY_TRUENAS_PROTOCOL"
+  _debug _ws_uri "$_ws_uri"
   _secure_debug2 DEPLOY_TRUENAS_APIKEY "$DEPLOY_TRUENAS_APIKEY"
   _info "Environment variables: OK"
 
@@ -168,25 +235,22 @@ truenas_ws_deploy() {
 
   if [ "$_ws_response" != "TRUE" ]; then
     _err "TrueNAS is not ready."
-    _err "Please check environment variables DEPLOY_TRUENAS_APIKEY, DEPLOY_TRUENAS_HOSTNAME and DEPLOY_TRUENAS_PROTOCOL."
+    _err "Please check environment variables DEPLOY_TRUENAS_APIKEY, DEPLOY_TRUENAS_HOSTNAME, DEPLOY_TRUENAS_PROTOCOL and DEPLOY_TRUENAS_PORT."
     _err "Verify API key."
     return 2
   fi
   _savedeployconf DEPLOY_TRUENAS_APIKEY "$DEPLOY_TRUENAS_APIKEY"
+  _savedeployconf DEPLOY_TRUENAS_HOSTNAME "$DEPLOY_TRUENAS_HOSTNAME"
+  _savedeployconf DEPLOY_TRUENAS_PROTOCOL "$DEPLOY_TRUENAS_PROTOCOL"
+  _savedeployconf DEPLOY_TRUENAS_PORT "$DEPLOY_TRUENAS_PORT"
   _info "TrueNAS health: OK"
 
   ########## System info
 
   _info "Gather system info..."
   _ws_response=$(_ws_call "system.info")
-  _truenas_system=$(printf "%s" "$_ws_response" | jq -r '."version"' | cut -d '-' -f 2 | tr '[:lower:]' '[:upper:]')
-  _truenas_version=$(printf "%s" "$_ws_response" | jq -r '."version"' | cut -d '-' -f 3)
-  _info "TrueNAS system: $_truenas_system"
+  _truenas_version=$(printf "%s" "$_ws_response" | jq -r '."version"')
   _info "TrueNAS version: $_truenas_version"
-  if [ "$_truenas_system" != "SCALE" ] && [ "$_truenas_system" != "CORE" ]; then
-    _err "Cannot gather TrueNAS system. Nor CORE oder SCALE detected."
-    return 10
-  fi
 
   ########## Gather current certificate
 
@@ -203,19 +267,26 @@ truenas_ws_deploy() {
   _certname="acme_$(_utc_date | tr -d '\-\:' | tr ' ' '_')"
   _info "New WebUI certificate name: $_certname"
   _debug _certname "$_certname"
-  _ws_jobid=$(_ws_call "certificate.create" "{\"name\": \"${_certname}\", \"create_type\": \"CERTIFICATE_CREATE_IMPORTED\", \"certificate\": \"$(_json_encode <"$_file_fullchain")\", \"privatekey\": \"$(_json_encode <"$_file_key")\", \"passphrase\": \"\"}")
-  _debug "_ws_jobid" "$_ws_jobid"
-  if ! _ws_check_jobid "$_ws_jobid"; then
-    _err "No JobID returned from websocket method."
-    return 3
-  fi
-  _ws_result=$(_ws_get_job_result "$_ws_jobid")
-  _ws_ret=$?
-  if [ $_ws_ret -gt 0 ]; then
-    return $_ws_ret
-  fi
-  _debug "_ws_result" "$_ws_result"
-  _new_certid=$(printf "%s" "$_ws_result" | jq -r '."id"')
+  _ws_out=$(_ws_upload_cert "$_file_fullchain" "$_file_key" "$_certname")
+
+  echo "$_ws_out" | while IFS= read -r LINE; do
+    case "$LINE" in
+    I:*)
+      _info "${LINE#I:}"
+      ;;
+    D:*)
+      _debug "${LINE#D:}"
+      ;;
+    E*)
+      _err "${LINE#E:}"
+      ;;
+    *) ;;
+
+    esac
+  done
+
+  _new_certid=$(echo "$_ws_out" | grep 'R:' | cut -d ':' -f 2)
+
   _info "New certificate ID: $_new_certid"
 
   ########## FTP
@@ -231,33 +302,31 @@ truenas_ws_deploy() {
 
   ########## ix Apps (SCALE only)
 
-  if [ "$_truenas_system" = "SCALE" ]; then
-    _info "Replace app certificates..."
-    _ws_response=$(_ws_call "app.query")
-    for _app_name in $(printf "%s" "$_ws_response" | jq -r '.[]."name"'); do
-      _info "Checking app $_app_name..."
-      _ws_response=$(_ws_call "app.config" "$_app_name")
-      if [ "$(printf "%s" "$_ws_response" | jq -r '."network" | has("certificate_id")')" = "true" ]; then
-        _info "App has certificate option, setup new certificate..."
-        _info "App will be redeployed after updating the certificate."
-        _ws_jobid=$(_ws_call "app.update" "$_app_name" "{\"values\": {\"network\": {\"certificate_id\": $_new_certid}}}")
-        _debug "_ws_jobid" "$_ws_jobid"
-        if ! _ws_check_jobid "$_ws_jobid"; then
-          _err "No JobID returned from websocket method."
-          return 3
-        fi
-        _ws_result=$(_ws_get_job_result "$_ws_jobid")
-        _ws_ret=$?
-        if [ $_ws_ret -gt 0 ]; then
-          return $_ws_ret
-        fi
-        _debug "_ws_result" "$_ws_result"
-        _info "App certificate replaced."
-      else
-        _info "App has no certificate option, skipping..."
+  _info "Replace app certificates..."
+  _ws_response=$(_ws_call "app.query")
+  for _app_name in $(printf "%s" "$_ws_response" | jq -r '.[]."name"'); do
+    _info "Checking app $_app_name..."
+    _ws_response=$(_ws_call "app.config" "$_app_name")
+    if [ "$(printf "%s" "$_ws_response" | jq -r '."network" | has("certificate_id")')" = "true" ]; then
+      _info "App has certificate option, setup new certificate..."
+      _info "App will be redeployed after updating the certificate."
+      _ws_jobid=$(_ws_call "app.update" "$_app_name" "{\"values\": {\"network\": {\"certificate_id\": $_new_certid}}}")
+      _debug "_ws_jobid" "$_ws_jobid"
+      if ! _ws_check_jobid "$_ws_jobid"; then
+        _err "No JobID returned from websocket method."
+        return 3
       fi
-    done
-  fi
+      _ws_result=$(_ws_get_job_result "$_ws_jobid")
+      _ws_ret=$?
+      if [ $_ws_ret -gt 0 ]; then
+        return $_ws_ret
+      fi
+      _debug "_ws_result" "$_ws_result"
+      _info "App certificate replaced."
+    else
+      _info "App has no certificate option, skipping..."
+    fi
+  done
 
   ########## WebUI
 
@@ -273,7 +342,7 @@ truenas_ws_deploy() {
   _info "Restarting WebUI..."
   _ws_response=$(_ws_call "system.general.ui_restart")
   _info "Waiting for UI restart..."
-  sleep 6
+  _sleep 15
 
   ########## Certificates
 
